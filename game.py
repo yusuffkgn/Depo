@@ -8,6 +8,7 @@ encounters.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
@@ -15,6 +16,11 @@ import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Sequence, Tuple, TypeAlias
+
+if importlib.util.find_spec("pygame") is None:
+    raise SystemExit(
+        "Pygame bulunamadı. Lütfen `python -m pip install -r requirements.txt` komutuyla kurun."
+    )
 
 import pygame
 

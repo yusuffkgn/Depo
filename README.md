@@ -10,11 +10,27 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Windows PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+py -m pip install -r requirements.txt
+```
+
 ## Çalıştırma
 
 ```bash
 python game.py
 ```
+
+## Sorun Giderme
+
+### `ModuleNotFoundError: No module named 'pygame'`
+
+- Sanal ortam aktifken `python -m pip install -r requirements.txt` komutunu çalıştırarak eksik bağımlılıkları yükleyin.
+- Komutu PowerShell içinde çalıştırıyorsanız `py -m pip install -r requirements.txt` kullanabilirsiniz.
+- Bağımlılıkları yükledikten sonra oyunu tekrar `python game.py` ile başlatın.
 
 ### Özellikler
 - Nova Seraph adlı yeni düşmana karşı yoğun savaş.
