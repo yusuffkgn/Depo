@@ -14,7 +14,7 @@ import os
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Sequence, Tuple
+from typing import Callable, List, Sequence, Tuple, TypeAlias
 
 import pygame
 
@@ -24,7 +24,7 @@ BASE_ARENA_RECT = pygame.Rect(0, 0, 420, 260)
 SAVE_FILE = Path("savegame.json")
 
 Color = Tuple[int, int, int]
-Vec2 = pygame.Vector2
+Vec2: TypeAlias = pygame.Vector2
 
 
 # ---------------------------------------------------------------------------
