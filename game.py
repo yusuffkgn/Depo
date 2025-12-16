@@ -28,6 +28,11 @@ SCREEN_SIZE = (960, 720)
 FPS = 60
 BASE_ARENA_RECT = pygame.Rect(0, 0, 420, 260)
 SAVE_FILE = Path("savegame.json")
+GRADIENT_STEPS = 18
+
+
+def lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * max(0.0, min(1.0, t))
 
 Color = Tuple[int, int, int]
 Vec2: TypeAlias = pygame.Vector2
@@ -75,10 +80,16 @@ class Player:
     friction: float = 0.92
     airborne: bool = False
     slow_move_factor: float = 0.45
+    coyote_window: float = 0.14
+    jump_buffer: float = 0.16
+    air_control: float = 0.72
 
     def __post_init__(self) -> None:
         self.hp = self.max_hp
         self.position = Vec2(self.arena.centerx, self.arena.centery)
+        self.trail: List[Tuple[Vec2, float]] = []
+        self.jump_buffer_timer = 0.0
+        self.coyote_timer = 0.0
 
     def reset_state(self, arena: pygame.Rect) -> None:
         self.arena = arena.copy()
@@ -86,6 +97,9 @@ class Player:
         self.velocity = Vec2()
         self.gravity = 0.0
         self.airborne = False
+        self.trail.clear()
+        self.jump_buffer_timer = 0.0
+        self.coyote_timer = 0.0
 
     def damage(self, amount: float) -> None:
         if self.invuln_timer <= 0:
@@ -101,9 +115,14 @@ class Player:
         if gravity == 0:
             self.airborne = False
             self.velocity.y = 0
+            self.coyote_timer = 0.0
         self.gravity = gravity
+        if gravity != 0:
+            self.coyote_timer = self.coyote_window
 
     def update(self, pressed: Sequence[bool], dt: float) -> None:
+        self.jump_buffer_timer = max(0.0, self.jump_buffer_timer - dt)
+        self.coyote_timer = max(0.0, self.coyote_timer - dt)
         speed = self.move_speed
         if pressed[pygame.K_LSHIFT] or pressed[pygame.K_RSHIFT]:
             speed *= self.slow_move_factor
@@ -111,6 +130,9 @@ class Player:
         else:
             heart_color = self.heart_color
         self.current_color = heart_color
+
+        if pressed[pygame.K_UP] or pressed[pygame.K_w]:
+            self.jump_buffer_timer = self.jump_buffer
 
         direction = Vec2(
             (pressed[pygame.K_RIGHT] or pressed[pygame.K_d])
@@ -120,15 +142,19 @@ class Player:
         )
         if self.gravity != 0:
             direction.y = 0
-            if (pressed[pygame.K_UP] or pressed[pygame.K_w]) and not self.airborne:
+            if self.jump_buffer_timer > 0 and self.coyote_timer > 0:
                 self.velocity.y = -self.jump_strength
                 self.airborne = True
+                self.jump_buffer_timer = 0.0
         if direction.length_squared() > 0:
             direction = direction.normalize()
-        self.velocity.x = direction.x * speed
+        target_speed = direction.x * speed
         if self.gravity == 0:
+            self.velocity.x = lerp(self.velocity.x, target_speed, dt * 14)
             self.velocity.y = direction.y * speed
         else:
+            control = self.air_control if self.airborne else 1.0
+            self.velocity.x = lerp(self.velocity.x, target_speed, dt * 8 * control)
             self.velocity.y += self.gravity * dt * 60
             self.velocity.y = min(self.velocity.y, 12)
 
@@ -141,12 +167,16 @@ class Player:
                 if abs(self.velocity.y) < 0.1:
                     self.velocity.y = 0
                 self.airborne = False
-        else:
-            if not self.arena.top <= self.position.y <= self.arena.bottom:
-                self.position.y = min(max(self.position.y, self.arena.top), self.arena.bottom)
+                self.coyote_timer = self.coyote_window
+            else:
+                if not self.arena.top <= self.position.y <= self.arena.bottom:
+                    self.position.y = min(max(self.position.y, self.arena.top), self.arena.bottom)
 
         if not self.arena.left <= self.position.x <= self.arena.right:
             self.position.x = min(max(self.position.x, self.arena.left), self.arena.right)
+
+        self.trail.append((self.position.copy(), pygame.time.get_ticks() / 1000.0))
+        self.trail = [p for p in self.trail if pygame.time.get_ticks() / 1000.0 - p[1] < 0.35]
 
         if self.invuln_timer > 0:
             self.invuln_timer = max(0.0, self.invuln_timer - dt)
@@ -155,6 +185,14 @@ class Player:
         blink = int(pygame.time.get_ticks() / 60) % 2 == 0
         if self.invuln_timer > 0 and blink:
             return
+        trail_surface = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+        now = pygame.time.get_ticks() / 1000.0
+        for pos, t in self.trail:
+            alpha = max(0, 150 - int((now - t) * 420))
+            if alpha <= 0:
+                continue
+            pygame.draw.circle(trail_surface, (*self.current_color, alpha // 2), (int(pos.x), int(pos.y)), 10)
+        surface.blit(trail_surface, (0, 0))
         pygame.draw.polygon(
             surface,
             self.current_color,
@@ -194,7 +232,6 @@ class Bullet:
 
     def collides(self, point: Vec2) -> bool:
         return self.position.distance_to(point) < self.radius
-
 
 def create_star_sprite(color: Color, inner: float, outer: float, points: int = 5) -> Callable[[pygame.Surface, Vec2, float], None]:
     base_surface = pygame.Surface((outer * 2 + 2, outer * 2 + 2), pygame.SRCALPHA)
@@ -500,6 +537,7 @@ class Enemy:
         self.attack_queue: List[int] = []
         self.attack_timer = 0.0
         self.slash_effect_time = -1.0
+        self.phase_flash_timer = 0.0
 
     def update(self, player: Player, arena: pygame.Rect, dt: float) -> None:
         if self.current_attack is None:
@@ -513,6 +551,7 @@ class Enemy:
                 self.attack_timer = 0.0
                 self.slash_effect_time = pygame.time.get_ticks() / 1000.0
         self.update_phase(player)
+        self.phase_flash_timer = max(0.0, self.phase_flash_timer - dt)
 
     def update_phase(self, player: Player) -> None:
         ratio = self.hp / self.max_hp
@@ -520,6 +559,7 @@ class Enemy:
             self.phase_index += 1
             player.invuln_timer = 1.5
             player.set_gravity(0)
+            self.phase_flash_timer = 1.0
 
     def start_next_attack(self, arena: pygame.Rect) -> None:
         if not self.attack_queue:
@@ -622,9 +662,20 @@ class Arena:
             interior, border = attack.arena_style()
         else:
             interior, border = (30, 30, 30), (230, 230, 230)
-        pygame.draw.rect(fill, (*interior, 200), fill.get_rect(), border_radius=18)
+        for i in range(3):
+            alpha = 160 - i * 30
+            pygame.draw.rect(
+                fill,
+                (*interior, alpha),
+                fill.get_rect().inflate(-i * 8, -i * 8),
+                border_radius=18 + i * 3,
+            )
         pygame.draw.rect(fill, (*border, 255), fill.get_rect(), 6, border_radius=18)
+        crosshair = pygame.Surface(fill.get_size(), pygame.SRCALPHA)
+        pygame.draw.line(crosshair, (*border, 60), (fill.get_width() / 2, 8), (fill.get_width() / 2, fill.get_height() - 8), 2)
+        pygame.draw.line(crosshair, (*border, 60), (8, fill.get_height() / 2), (fill.get_width() - 8, fill.get_height() / 2), 2)
         surface.blit(fill, fill.get_rect(center=self.rect.center))
+        surface.blit(crosshair, fill.get_rect(center=self.rect.center))
 
 
 class Background:
@@ -633,6 +684,15 @@ class Background:
             [Vec2(random.uniform(0, SCREEN_SIZE[0]), random.uniform(0, SCREEN_SIZE[1])), random.uniform(20, 60), random.uniform(0.2, 0.6)]
             for _ in range(28)
         ]
+        self.rings = [
+            {
+                "center": Vec2(SCREEN_SIZE[0] / 2, SCREEN_SIZE[1] / 2 + random.uniform(-120, 120)),
+                "radius": random.uniform(180, 320),
+                "speed": random.uniform(0.4, 1.2),
+                "phase": random.uniform(0, math.pi * 2),
+            }
+            for _ in range(4)
+        ]
 
     def update(self, dt: float) -> None:
         for orb in self.orbs:
@@ -640,19 +700,35 @@ class Background:
             if orb[0].y > SCREEN_SIZE[1] + 30:
                 orb[0].y = -30
                 orb[0].x = random.uniform(0, SCREEN_SIZE[0])
+        for ring in self.rings:
+            ring["phase"] += dt * ring["speed"]
 
     def draw(self, surface: pygame.Surface, palette: Tuple[Color, Color, Color]) -> None:
         base, glow, accent = palette
         gradient = pygame.Surface(SCREEN_SIZE)
-        for y in range(SCREEN_SIZE[1]):
-            t = y / SCREEN_SIZE[1]
-            color = (
-                int(base[0] * (1 - t) + glow[0] * t),
-                int(base[1] * (1 - t) + glow[1] * t),
-                int(base[2] * (1 - t) + glow[2] * t),
+        for i in range(GRADIENT_STEPS):
+            t0 = i / GRADIENT_STEPS
+            t1 = (i + 1) / GRADIENT_STEPS
+            color0 = (
+                int(base[0] * (1 - t0) + glow[0] * t0),
+                int(base[1] * (1 - t0) + glow[1] * t0),
+                int(base[2] * (1 - t0) + glow[2] * t0),
             )
-            pygame.draw.line(gradient, color, (0, y), (SCREEN_SIZE[0], y))
-        surface.blit(gradient, (0, 0))
+            color1 = (
+                int(base[0] * (1 - t1) + glow[0] * t1),
+                int(base[1] * (1 - t1) + glow[1] * t1),
+                int(base[2] * (1 - t1) + glow[2] * t1),
+            )
+            band = pygame.Surface((SCREEN_SIZE[0], SCREEN_SIZE[1] // GRADIENT_STEPS + 2))
+            band.fill(color0)
+            pygame.draw.rect(band, color1, band.get_rect(), 0)
+            surface.blit(band, (0, int(t0 * SCREEN_SIZE[1])))
+        overlay = pygame.Surface(SCREEN_SIZE, pygame.SRCALPHA)
+        pygame.draw.rect(overlay, (*accent, 22), overlay.get_rect(), width=8)
+        surface.blit(overlay, (0, 0))
+        for ring in self.rings:
+            alpha = 40 + int(40 * math.sin(ring["phase"]))
+            pygame.draw.circle(surface, (*accent, alpha), ring["center"], int(ring["radius"]), width=2)
         for pos, radius, speed in self.orbs:
             pygame.draw.circle(surface, accent, (int(pos.x), int(pos.y)), int(radius * 0.4), width=2)
             pygame.draw.circle(surface, glow, (int(pos.x), int(pos.y)), int(radius * 0.6), width=1)
@@ -698,29 +774,85 @@ class TitleScreen:
         self.options = ["Story", "Challenge", "Nightmare"]
         self.selection = 0
         self.pulse_timer = 0.0
+        self.flare_timer = 0.0
+        self.orbiters = [
+            {
+                "angle": random.uniform(0, math.tau),
+                "radius": random.uniform(120, 180),
+                "speed": random.uniform(0.7, 1.3),
+            }
+            for _ in range(8)
+        ]
+        self.showing_help = False
 
     def update(self, dt: float) -> None:
         self.pulse_timer += dt
+        self.flare_timer += dt
+        for orb in self.orbiters:
+            orb["angle"] += dt * orb["speed"]
 
     def draw(self, surface: pygame.Surface, best_times: dict) -> None:
         title = self.font_large.render("RESONANT SOUL", True, (255, 255, 255))
-        surface.blit(title, title.get_rect(center=(SCREEN_SIZE[0] / 2, 140)))
+        glow = pygame.transform.rotozoom(title, 0, 1.04)
+        glow.set_alpha(90)
+        surface.blit(glow, glow.get_rect(center=(SCREEN_SIZE[0] / 2, 120)))
+        surface.blit(title, title.get_rect(center=(SCREEN_SIZE[0] / 2, 120)))
+
+        center = Vec2(SCREEN_SIZE[0] / 2, 260)
+        for orb in self.orbiters:
+            pos = center + Vec2(math.cos(orb["angle"]), math.sin(orb["angle"])) * orb["radius"]
+            alpha = 140 + int(80 * math.sin(self.pulse_timer * 2 + orb["angle"]))
+            halo = pygame.Surface((18, 18), pygame.SRCALPHA)
+            pygame.draw.circle(halo, (180, 220, 255, alpha), (9, 9), 8)
+            surface.blit(halo, halo.get_rect(center=pos))
+
+        panel = pygame.Surface((620, 340), pygame.SRCALPHA)
+        pygame.draw.rect(panel, (12, 10, 22, 180), panel.get_rect(), border_radius=18)
+        pygame.draw.rect(panel, (255, 255, 255, 60), panel.get_rect(), 2, border_radius=18)
+        surface.blit(panel, panel.get_rect(center=(SCREEN_SIZE[0] / 2, 360)))
+
+        descriptions = {
+            "Story": "Sinema tadında, öğrenme odaklı tempolu dövüş.",
+            "Challenge": "Hareket eden arenada yoğun mermi desenleri.",
+            "Nightmare": "Az tolerans, saldırı rotasyonu hızlanır, arena daralır.",
+        }
 
         for i, option in enumerate(self.options):
             is_selected = i == self.selection
-            base_color = (255, 200, 120) if is_selected else (200, 200, 220)
-            pulse = 1.0 + 0.1 * math.sin(self.pulse_timer * 4 + i)
+            base_color = (255, 210, 140) if is_selected else (200, 210, 230)
+            pulse = 1.0 + 0.08 * math.sin(self.pulse_timer * 5 + i)
             text = self.font_small.render(f"{option} Mode", True, base_color)
-            rendered = pygame.transform.rotozoom(text, math.sin(self.pulse_timer * 3 + i) * (4 if is_selected else 0), pulse)
-            rect = rendered.get_rect(center=(SCREEN_SIZE[0] / 2, 280 + i * 80))
+            rendered = pygame.transform.rotozoom(text, math.sin(self.pulse_timer * 3 + i) * (3 if is_selected else 0), pulse)
+            rect = rendered.get_rect(center=(SCREEN_SIZE[0] / 2, 270 + i * 84))
             surface.blit(rendered, rect)
+            desc_text = self.font_small.render(descriptions[option], True, (180, 190, 210))
+            surface.blit(desc_text, desc_text.get_rect(center=(SCREEN_SIZE[0] / 2, rect.bottom + 22)))
             best = best_times.get(option, 0.0)
             if best:
-                best_text = self.font_small.render(f"Best survival: {best:.1f}s", True, (200, 240, 255))
-                surface.blit(best_text, best_text.get_rect(center=(SCREEN_SIZE[0] / 2, rect.bottom + 24)))
+                best_text = self.font_small.render(f"En iyi: {best:.1f}s", True, (170, 240, 255))
+                surface.blit(best_text, best_text.get_rect(center=(SCREEN_SIZE[0] / 2, rect.bottom + 50)))
 
-        hint = self.font_small.render("Press ENTER to challenge Nova Seraph", True, (220, 180, 255))
-        surface.blit(hint, hint.get_rect(center=(SCREEN_SIZE[0] / 2, SCREEN_SIZE[1] - 80)))
+        if self.showing_help:
+            self.draw_help(surface)
+
+        hint_text = "ENTER: Başlat | SHIFT: Hassas hareket | H: Yardım"
+        hint = self.font_small.render(hint_text, True, (220, 180, 255))
+        surface.blit(hint, hint.get_rect(center=(SCREEN_SIZE[0] / 2, SCREEN_SIZE[1] - 60)))
+
+    def draw_help(self, surface: pygame.Surface) -> None:
+        panel = pygame.Surface((SCREEN_SIZE[0] - 200, 200), pygame.SRCALPHA)
+        pygame.draw.rect(panel, (15, 12, 28, 220), panel.get_rect(), border_radius=16)
+        pygame.draw.rect(panel, (255, 255, 255, 50), panel.get_rect(), 2, border_radius=16)
+        controls = [
+            "Yön Tuşları / WASD: Hareket",
+            "W/UP yerçekiminde iken: Zıpla (coyote time + bufferlı)",
+            "SHIFT: Hassas hareket, dar mermilerde avantaj",
+            "Kalp izi ve arena titreşimi hızınıza göre tepki verir.",
+        ]
+        for i, line in enumerate(controls):
+            text = self.font_small.render(line, True, (210, 220, 240))
+            panel.blit(text, text.get_rect(center=(panel.get_width() / 2, 50 + i * 34)))
+        surface.blit(panel, panel.get_rect(center=(SCREEN_SIZE[0] / 2, SCREEN_SIZE[1] - 170)))
 
     def handle_input(self, event: pygame.event.Event) -> str | None:
         if event.type == pygame.KEYDOWN:
@@ -730,6 +862,8 @@ class TitleScreen:
                 self.selection = (self.selection - 1) % len(self.options)
             elif event.key == pygame.K_RETURN:
                 return self.options[self.selection]
+            elif event.key == pygame.K_h:
+                self.showing_help = not self.showing_help
         return None
 
 
@@ -740,24 +874,36 @@ class HUD:
 
     def draw(self, surface: pygame.Surface, player: Player, enemy: Enemy, survival_time: float, difficulty: str) -> None:
         hp_ratio = player.hp / player.max_hp
-        hp_bar_rect = pygame.Rect(40, SCREEN_SIZE[1] - 100, 280, 24)
-        pygame.draw.rect(surface, (80, 20, 20), hp_bar_rect.inflate(8, 8), border_radius=8)
-        inner_rect = hp_bar_rect.inflate(-4, -4)
+        hp_bar_rect = pygame.Rect(40, SCREEN_SIZE[1] - 110, 320, 30)
+        pygame.draw.rect(surface, (40, 12, 22), hp_bar_rect.inflate(10, 10), border_radius=10)
+        inner_rect = hp_bar_rect.inflate(-6, -6)
         fill_width = int(inner_rect.width * hp_ratio)
-        pygame.draw.rect(surface, (220, 60, 80), (inner_rect.left, inner_rect.top, fill_width, inner_rect.height), border_radius=6)
-        pygame.draw.rect(surface, (255, 255, 255), inner_rect, 2, border_radius=6)
+        if fill_width > 0:
+            gradient = pygame.Surface((fill_width, inner_rect.height))
+            for x in range(fill_width):
+                t = x / max(1, fill_width)
+                color = (
+                    int(220 + 20 * t),
+                    int(60 + 80 * t),
+                    int(80 + 60 * (1 - t)),
+                )
+                pygame.draw.line(gradient, color, (x, 0), (x, inner_rect.height))
+            surface.blit(gradient, (inner_rect.left, inner_rect.top))
+        pygame.draw.rect(surface, (255, 255, 255), inner_rect, 2, border_radius=8)
 
         hp_text = self.big_font.render(f"HP {int(player.hp)}/{player.max_hp}", True, (255, 220, 220))
-        surface.blit(hp_text, (hp_bar_rect.left, hp_bar_rect.top - 42))
+        surface.blit(hp_text, (hp_bar_rect.left, hp_bar_rect.top - 48))
 
+        info_panel = pygame.Surface((320, 120), pygame.SRCALPHA)
+        pygame.draw.rect(info_panel, (12, 10, 20, 180), info_panel.get_rect(), border_radius=12)
+        pygame.draw.rect(info_panel, (255, 255, 255, 60), info_panel.get_rect(), 2, border_radius=12)
         enemy_text = self.font.render(f"{enemy.name} {int(enemy.hp)} / {enemy.max_hp}", True, (255, 255, 255))
-        surface.blit(enemy_text, (SCREEN_SIZE[0] - 320, 40))
-
-        timer_text = self.font.render(f"Survival: {survival_time:.1f}s", True, (200, 255, 200))
-        surface.blit(timer_text, (SCREEN_SIZE[0] - 320, 80))
-
-        diff_text = self.font.render(f"Difficulty: {difficulty}", True, (220, 200, 255))
-        surface.blit(diff_text, (SCREEN_SIZE[0] - 320, 110))
+        info_panel.blit(enemy_text, (16, 14))
+        timer_text = self.font.render(f"Hayatta kalma: {survival_time:.1f}s", True, (200, 255, 200))
+        info_panel.blit(timer_text, (16, 46))
+        diff_text = self.font.render(f"Zorluk: {difficulty}", True, (220, 200, 255))
+        info_panel.blit(diff_text, (16, 78))
+        surface.blit(info_panel, (SCREEN_SIZE[0] - 360, 36))
 
 
 class Game:
@@ -837,6 +983,7 @@ class Game:
     def start_battle(self, difficulty: str) -> None:
         difficulty_scale = {"Story": 0.8, "Challenge": 1.0, "Nightmare": 1.35}[difficulty]
         self.difficulty = difficulty
+        self.title_screen.showing_help = False
         self.enemy = Enemy("Nova Seraph", difficulty)
         self.player = Player(self.arena.rect.copy(), difficulty_scale)
         self.player.heal_full()
@@ -862,21 +1009,36 @@ class Game:
         self.screen.blit(arena_surface, self.arena.rect)
         self.hud.draw(self.screen, self.player, self.enemy, self.survival_time, self.difficulty)
         self.slash.draw(self.screen)
+        if self.enemy.phase_flash_timer > 0:
+            overlay = pygame.Surface(SCREEN_SIZE, pygame.SRCALPHA)
+            alpha = int(180 * self.enemy.phase_flash_timer)
+            pygame.draw.rect(overlay, (255, 255, 255, alpha // 2), overlay.get_rect(), border_radius=12)
+            badge = pygame.Surface((420, 90), pygame.SRCALPHA)
+            pygame.draw.rect(badge, (phase.palette[1][0], phase.palette[1][1], phase.palette[1][2], 200), badge.get_rect(), border_radius=18)
+            pygame.draw.rect(badge, (255, 255, 255, 90), badge.get_rect(), 3, border_radius=18)
+            text = pygame.font.Font(None, 48).render("Faz Değişimi", True, (255, 255, 255))
+            badge.blit(text, text.get_rect(center=(badge.get_width() / 2, badge.get_height() / 2)))
+            overlay.blit(badge, badge.get_rect(center=(SCREEN_SIZE[0] / 2, 80)))
+            self.screen.blit(overlay, (0, 0))
 
     def draw_defeat(self) -> None:
         palette = ((20, 0, 0), (40, 10, 10), (120, 40, 40))
         self.background.draw(self.screen, palette)
         font_big = pygame.font.Font(None, 120)
         font_small = pygame.font.Font(None, 40)
+        glass = pygame.Surface((SCREEN_SIZE[0] - 200, 300), pygame.SRCALPHA)
+        pygame.draw.rect(glass, (30, 8, 8, 210), glass.get_rect(), border_radius=20)
+        pygame.draw.rect(glass, (255, 255, 255, 60), glass.get_rect(), 3, border_radius=20)
         defeat = font_big.render("DEFEATED", True, (255, 180, 180))
-        self.screen.blit(defeat, defeat.get_rect(center=(SCREEN_SIZE[0] / 2, 220)))
-        prompt = font_small.render("Press ENTER to try again", True, (255, 220, 220))
-        self.screen.blit(prompt, prompt.get_rect(center=(SCREEN_SIZE[0] / 2, 420)))
-        stats = font_small.render(f"Survival time: {self.survival_time:.1f}s", True, (200, 255, 200))
-        self.screen.blit(stats, stats.get_rect(center=(SCREEN_SIZE[0] / 2, 470)))
+        glass.blit(defeat, defeat.get_rect(center=(glass.get_width() / 2, 80)))
+        prompt = font_small.render("ENTER: Başlangıca dön | ESC: Çıkış", True, (255, 220, 220))
+        glass.blit(prompt, prompt.get_rect(center=(glass.get_width() / 2, 160)))
+        stats = font_small.render(f"Hayatta kalma: {self.survival_time:.1f}s", True, (200, 255, 200))
+        glass.blit(stats, stats.get_rect(center=(glass.get_width() / 2, 200)))
         best = self.save_data.get("best_time", {}).get(self.difficulty, 0.0)
-        best_text = font_small.render(f"Best for {self.difficulty}: {best:.1f}s", True, (220, 200, 255))
-        self.screen.blit(best_text, best_text.get_rect(center=(SCREEN_SIZE[0] / 2, 520)))
+        best_text = font_small.render(f"{self.difficulty} rekoru: {best:.1f}s", True, (220, 200, 255))
+        glass.blit(best_text, best_text.get_rect(center=(glass.get_width() / 2, 238)))
+        self.screen.blit(glass, glass.get_rect(center=(SCREEN_SIZE[0] / 2, SCREEN_SIZE[1] / 2)))
 
 
 if __name__ == "__main__":
